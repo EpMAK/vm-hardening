@@ -145,6 +145,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     aide \
     aide-common \
     libpam-pwquality \
+    libpam-modules \
     acl \
     apparmor \
     apparmor-utils \
@@ -155,8 +156,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     logrotate \
     open-vm-tools \
     chrony \
-    sudo \
-    libpam-faillock
+    sudo
 
 # 2.3 Remove unnecessary packages
 echo "[2.3] Removing unnecessary packages"
