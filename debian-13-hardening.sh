@@ -62,7 +62,10 @@ apt-get install -y -qq locales
 
 # Generate required locales
 for locale in $LOCALES; do
-    sed -i "s/^# ${locale}/${locale}/" /etc/locale.gen 2>/dev/null ||         echo "${locale} UTF-8" >> /etc/locale.gen
+    if ! grep -q "^${locale}" /etc/locale.gen 2>/dev/null; then
+        sed -i "s/^# *${locale}/${locale}/" /etc/locale.gen 2>/dev/null || true
+        grep -q "^${locale}" /etc/locale.gen || echo "${locale} UTF-8" >> /etc/locale.gen
+    fi
 done
 locale-gen
 
@@ -97,8 +100,8 @@ EOF
 
 # 1.2 Apply mount options to /tmp
 echo "[1.2] Hardening /tmp mount options"
-if ! grep -q "nodev.*nosuid.*noexec" /etc/fstab | grep "/tmp"; then
-    sed -i '/\s\/tmp\s/s/defaults/defaults,nodev,nosuid,noexec/' /etc/fstab
+if ! grep -P "\s/tmp\s" /etc/fstab | grep -q "noexec"; then
+    sed -i '/[[:space:]]\/tmp[[:space:]]/s/defaults/defaults,nodev,nosuid,noexec/' /etc/fstab
 fi
 
 # 1.3 /dev/shm hardening
@@ -186,10 +189,7 @@ cat > /etc/security/limits.d/cis-coredump.conf << 'EOF'
 * hard core 0
 EOF
 
-cat >> /etc/sysctl.d/99-cis.conf << 'EOF'
-# Disable core dumps
-fs.suid_dumpable = 0
-EOF
+# Note: fs.suid_dumpable is set in section 4 sysctl block
 
 # -----------------------------------------------------------------------------
 # SECTION 4 - Kernel / sysctl Hardening
@@ -390,9 +390,12 @@ echo "[7] User & Group Security"
 
 # 7.1 Root is the only UID 0 account
 echo "[7.1] Checking UID 0 accounts"
-awk -F: '($3 == 0) { print $1 }' /etc/passwd | grep -v "^root$" | while read user; do
-    echo "WARNING: Non-root UID 0 account found: $user"
-done
+UID0_USERS=$(awk -F: '($3 == 0) { print $1 }' /etc/passwd | grep -v "^root$" || true)
+if [ -n "$UID0_USERS" ]; then
+    echo "WARNING: Non-root UID 0 accounts found: $UID0_USERS"
+else
+    echo "[7.1] OK - root is the only UID 0 account"
+fi
 
 # 7.2 Ensure root PATH integrity
 if echo "$PATH" | grep -q "::"; then
@@ -401,9 +404,9 @@ fi
 
 # 7.3 Lock system accounts
 echo "[7.3] Locking system accounts"
-awk -F: '($3 < 1000) {print $1}' /etc/passwd | grep -v "^root$" | while read user; do
+while IFS= read -r user; do
     passwd -l "$user" 2>/dev/null || true
-done
+done < <(awk -F: '($3 < 1000) {print $1}' /etc/passwd | grep -v "^root$" || true)
 
 # 7.4 Remove legacy + entries from passwd/shadow/group
 sed -i '/^+:/d' /etc/passwd /etc/shadow /etc/group
@@ -659,11 +662,11 @@ echo "[15] Time Synchronization"
 systemctl enable chrony
 systemctl start chrony
 
-# Restrict chrony to localhost query
-# Set NTP servers from parameters
+# Replace default pool/server lines with our NTP servers
+sed -i '/^pool /d' /etc/chrony/chrony.conf
+sed -i '/^server /d' /etc/chrony/chrony.conf
 for srv in $NTP_SERVERS; do
-    grep -q "^server $srv" /etc/chrony/chrony.conf || \
-        echo "server $srv iburst" >> /etc/chrony/chrony.conf
+    echo "server $srv iburst" >> /etc/chrony/chrony.conf
 done
 grep -q "^bindaddress" /etc/chrony/chrony.conf || \
     echo "bindaddress 127.0.0.1" >> /etc/chrony/chrony.conf
@@ -702,7 +705,7 @@ update-grub
 
 # 17.2 udev rule to pin first vmxnet3 NIC to eth0
 cat > /etc/udev/rules.d/70-persistent-net.rules << 'EOF'
-SUBSYSTEM=="net", ACTION=="add", DRIVERS=="vmxnet3", ATTR{type}=="1", NAME="eth0"
+SUBSYSTEM=="net", ACTION=="add", DRIVERS=="vmxnet3", ATTR{type}=="1", KERNEL=="en*", NAME="eth0"
 EOF
 
 # 17.3 Ensure ifupdown is managing networking (not networkd)
@@ -737,130 +740,6 @@ cat > /etc/cron.daily/aide-check << 'EOF'
 EOF
 chmod 700 /etc/cron.daily/aide-check
 
-# =============================================================================
-# SECTION 19 - Drop-in Boot Customization Script
-# =============================================================================
-echo "[19] Installing boot customization script"
-
-# This script is installed on the TEMPLATE.
-# Before deploying each VM, edit /etc/vm-init/vm-init.conf with that VM's values.
-# On first boot it applies hostname + static network config then disables itself.
-
-mkdir -p /etc/vm-init
-
-# --- Configuration file (fill in per VM before sealing or after deploy) ---
-cat > /etc/vm-init/vm-init.conf << 'EOF'
-# =============================================================================
-# VM Init Configuration
-# Fill in these values before deploying each VM from template
-# =============================================================================
-
-HOSTNAME="changeme"
-IP_ADDRESS="10.0.0.1"
-NETMASK="255.255.255.0"
-GATEWAY="10.0.0.1"
-DNS1="10.0.0.1"
-DNS2="10.0.0.2"
-SEARCH_DOMAIN="your.domain.local"
-EOF
-
-# --- Boot script ---
-cat > /usr/local/sbin/vm-init.sh << 'INITEOF'
-#!/bin/bash
-# =============================================================================
-# VM Init Script - runs once on first boot to apply network config
-# =============================================================================
-
-LOG="/var/log/vm-init.log"
-CONF="/etc/vm-init/vm-init.conf"
-DONE="/etc/vm-init/.done"
-
-# Skip if already ran
-if [ -f "$DONE" ]; then
-    exit 0
-fi
-
-echo "$(date) - vm-init starting" >> "$LOG"
-
-# Bail if config not filled in
-if [ ! -f "$CONF" ]; then
-    echo "$(date) - ERROR: $CONF not found" >> "$LOG"
-    exit 1
-fi
-
-source "$CONF"
-
-# Validate config was actually filled in
-if [ "$HOSTNAME" = "changeme" ]; then
-    echo "$(date) - ERROR: vm-init.conf not configured" >> "$LOG"
-    exit 1
-fi
-
-# --- Apply hostname ---
-hostnamectl set-hostname "$HOSTNAME"
-sed -i "/127.0.1.1/d" /etc/hosts
-echo "127.0.1.1 $HOSTNAME" >> /etc/hosts
-echo "$(date) - Hostname set to $HOSTNAME" >> "$LOG"
-
-# --- Apply network ---
-cat > /etc/network/interfaces << EOF
-auto lo
-iface lo inet loopback
-
-auto eth0
-iface eth0 inet static
-    address ${IP_ADDRESS}
-    netmask ${NETMASK}
-    gateway ${GATEWAY}
-    dns-nameservers ${DNS1} ${DNS2}
-EOF
-
-# --- Apply DNS ---
-chattr -i /etc/resolv.conf 2>/dev/null || true
-cat > /etc/resolv.conf << EOF
-search ${SEARCH_DOMAIN}
-nameserver ${DNS1}
-nameserver ${DNS2}
-EOF
-chattr +i /etc/resolv.conf
-
-# --- Restart networking ---
-systemctl restart networking
-echo "$(date) - Network configured: $IP_ADDRESS" >> "$LOG"
-
-# --- Mark as done so it never runs again ---
-touch "$DONE"
-echo "$(date) - vm-init complete" >> "$LOG"
-
-# --- Disable the service ---
-systemctl disable vm-init.service
-INITEOF
-
-chmod 700 /usr/local/sbin/vm-init.sh
-chown root:root /usr/local/sbin/vm-init.sh
-
-# --- systemd service to run on first boot ---
-cat > /etc/systemd/system/vm-init.service << 'EOF'
-[Unit]
-Description=VM First Boot Initialization
-After=network-pre.target
-Before=network.target
-ConditionPathExists=!/etc/vm-init/.done
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/vm-init.sh
-RemainAfterExit=yes
-StandardOutput=journal+console
-StandardError=journal+console
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl enable vm-init.service
-echo "[19] Boot customization script installed"
-echo "     Edit /etc/vm-init/vm-init.conf before deploying each VM"
 
 # =============================================================================
 # SUMMARY
