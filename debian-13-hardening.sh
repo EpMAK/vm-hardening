@@ -13,13 +13,13 @@
 LOCALES="kk_KZ.UTF-8 ru_RU.UTF-8 en_US.UTF-8"
 DEFAULT_LOCALE="kk_KZ.UTF-8"
 
-# NTP servers
-NTP_SERVERS="0.kz.pool.ntp.org 1.kz.pool.ntp.org 2.europe.pool.ntp.org"
-
 # Timezone
 TIMEZONE="Asia/Almaty"
 
-# Default umask
+# NTP servers
+NTP_SERVERS="0.kz.pool.ntp.org 1.kz.pool.ntp.org 2.europe.pool.ntp.org"
+
+# Umask
 UMASK="027"
 
 # Password policy
@@ -34,6 +34,9 @@ LOCKOUT_TIME=900
 
 # Sudo timeout (minutes)
 SUDO_TIMEOUT=15
+
+# NOTE: Network is handled automatically by VCD IP Pool + VMware Tools
+#       Hostname is set per-VM via vm-customize.sh pasted in VCD
 
 # =============================================================================
 # END PARAMETERS
@@ -87,6 +90,9 @@ install hfsplus /bin/true
 install squashfs /bin/true
 install udf /bin/true
 install usb-storage /bin/true
+
+# Disable IPv6
+blacklist ipv6
 EOF
 
 # 1.2 Apply mount options to /tmp
@@ -266,6 +272,11 @@ kernel.unprivileged_bpf_disabled = 1
 
 # --- Kernel: Restrict perf events ---
 kernel.perf_event_paranoid = 3
+
+# --- Disable IPv6 completely ---
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
 
 sysctl --system > /dev/null 2>&1
@@ -685,7 +696,7 @@ chmod 600 /var/log/sudo.log
 echo "[17] Legacy Interface Naming"
 
 # 17.1 GRUB kernel parameters
-sed -i 's/GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0"/' \
+sed -i 's/GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0 ipv6.disable=1"/' \
     /etc/default/grub
 update-grub
 
