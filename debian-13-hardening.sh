@@ -36,7 +36,7 @@ LOCKOUT_TIME=900
 SUDO_TIMEOUT=15
 
 # NOTE: Network is handled automatically by VCD IP Pool + VMware Tools
-#       Hostname is set per-VM via vm-customize.sh pasted in VCD
+#       Hostname/DNS/NTP set per-VM via vm-customize.sh pasted in VCD
 
 # =============================================================================
 # END PARAMETERS
@@ -58,7 +58,7 @@ echo "============================================="
 echo "[0] Locale & Timezone"
 
 apt-get update -qq
-apt-get install -y -qq locales
+apt-get install -y -qq locales tzdata
 
 # Generate required locales
 for locale in $LOCALES; do
@@ -70,10 +70,12 @@ done
 locale-gen
 
 # Set system default locale
-update-locale LANG="$DEFAULT_LOCALE" LC_ALL="$DEFAULT_LOCALE"
+update-locale LANG="$DEFAULT_LOCALE"
+echo "LANG=$DEFAULT_LOCALE" > /etc/default/locale
 
 # Set timezone
-timedatectl set-timezone "$TIMEZONE"
+timedatectl set-timezone "$TIMEZONE" 2>/dev/null || \
+    ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
 echo "[0] Locale: $DEFAULT_LOCALE | Timezone: $TIMEZONE"
 
 # -----------------------------------------------------------------------------
@@ -82,8 +84,7 @@ echo "[0] Locale: $DEFAULT_LOCALE | Timezone: $TIMEZONE"
 echo "[1] Filesystem Configuration"
 
 # 1.1 Disable unused filesystems
-MODPROBE_CONF="/etc/modprobe.d/cis-disable-fs.conf"
-cat > "$MODPROBE_CONF" << 'EOF'
+cat > /etc/modprobe.d/cis-disable-fs.conf << 'EOF'
 # CIS - Disable unused/risky filesystems
 install cramfs /bin/true
 install freevxfs /bin/true
@@ -93,15 +94,23 @@ install hfsplus /bin/true
 install squashfs /bin/true
 install udf /bin/true
 install usb-storage /bin/true
-
-# Disable IPv6
+# Disable IPv6 module
 blacklist ipv6
 EOF
 
 # 1.2 Apply mount options to /tmp
 echo "[1.2] Hardening /tmp mount options"
-if ! grep -P "\s/tmp\s" /etc/fstab | grep -q "noexec"; then
-    sed -i '/[[:space:]]\/tmp[[:space:]]/s/defaults/defaults,nodev,nosuid,noexec/' /etc/fstab
+if grep -qP '\s/tmp\s' /etc/fstab; then
+    if ! grep -P '\s/tmp\s' /etc/fstab | grep -q "noexec"; then
+        sed -i '/[[:space:]]\/tmp[[:space:]]/s/defaults/defaults,nodev,nosuid,noexec/' /etc/fstab
+    fi
+else
+    echo "# /tmp is on LVM - mount options applied via systemd"
+    mkdir -p /etc/systemd/system/tmp.mount.d
+    cat > /etc/systemd/system/tmp.mount.d/cis.conf << 'EOF'
+[Mount]
+Options=mode=1777,strictatime,nosuid,nodev,noexec
+EOF
 fi
 
 # 1.3 /dev/shm hardening
@@ -109,16 +118,13 @@ echo "[1.3] Hardening /dev/shm"
 if ! grep -q "/dev/shm" /etc/fstab; then
     echo "tmpfs /dev/shm tmpfs defaults,nodev,nosuid,noexec 0 0" >> /etc/fstab
 fi
-
-# Remount immediately
-mount -o remount,nodev,nosuid,noexec /tmp 2>/dev/null || true
 mount -o remount,nodev,nosuid,noexec /dev/shm 2>/dev/null || true
 
 # 1.4 Sticky bit on all world-writable directories
 echo "[1.4] Setting sticky bit on world-writable dirs"
-df --local -P | awk '{if (NR!=1) print $6}' | \
+df --local -P 2>/dev/null | awk 'NR>1 {print $6}' | \
     xargs -I '{}' find '{}' -xdev -type d -perm -0002 2>/dev/null | \
-    xargs chmod a+t 2>/dev/null || true
+    xargs -r chmod a+t 2>/dev/null || true
 
 # -----------------------------------------------------------------------------
 # SECTION 2 - Software Updates & Package Management
@@ -128,18 +134,17 @@ echo "[2] Software & Package Management"
 # 2.1 Update all packages
 echo "[2.1] Updating packages"
 apt-get update -qq
-apt-get upgrade -y -qq
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
 apt-get autoremove -y -qq
 
 # 2.2 Install required security packages
 echo "[2.2] Installing security packages"
-apt-get install -y -qq \
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     auditd \
     audispd-plugins \
     aide \
     aide-common \
     libpam-pwquality \
-    libpam-google-authenticator \
     acl \
     apparmor \
     apparmor-utils \
@@ -150,46 +155,68 @@ apt-get install -y -qq \
     logrotate \
     open-vm-tools \
     chrony \
-    sudo
+    sudo \
+    libpam-faillock
 
 # 2.3 Remove unnecessary packages
 echo "[2.3] Removing unnecessary packages"
-apt-get purge -y -qq \
+DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq \
     telnet \
     rsh-client \
-    rsh-redone-client \
     talk \
-    talkd \
     xinetd \
     nis \
-    yp-tools \
     tftp \
-    atftpd \
-    tftpd \
     tftpd-hpa \
-    finger \
     nfs-kernel-server \
-    rpcbind 2>/dev/null || true
+    rpcbind \
+    avahi-daemon \
+    cups \
+    isc-dhcp-server \
+    bind9 \
+    vsftpd \
+    apache2 \
+    dovecot-core \
+    samba \
+    squid \
+    snmpd 2>/dev/null || true
 
 apt-get autoremove -y -qq
 
+# 2.4 Remove cloud-init completely
+echo "[2.4] Removing cloud-init"
+DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq cloud-init 2>/dev/null || true
+rm -rf /etc/cloud /var/lib/cloud /run/cloud-init
+apt-get autoremove -y -qq
+
 # -----------------------------------------------------------------------------
-# SECTION 3 - Secure Boot / Bootloader
+# SECTION 3 - Bootloader Hardening
 # -----------------------------------------------------------------------------
 echo "[3] Bootloader Hardening"
 
-# 3.1 Set GRUB password (generates a placeholder - change in production)
-echo "[3.1] Setting GRUB permissions"
-chown root:root /boot/grub/grub.cfg 2>/dev/null || true
-chmod 600 /boot/grub/grub.cfg 2>/dev/null || true
+# 3.1 Secure grub.cfg permissions
+if [ -f /boot/grub/grub.cfg ]; then
+    chown root:root /boot/grub/grub.cfg
+    chmod 600 /boot/grub/grub.cfg
+fi
+if [ -f /boot/grub2/grub.cfg ]; then
+    chown root:root /boot/grub2/grub.cfg
+    chmod 600 /boot/grub2/grub.cfg
+fi
 
 # 3.2 Restrict core dumps
-echo "[3.2] Restricting core dumps"
 cat > /etc/security/limits.d/cis-coredump.conf << 'EOF'
 * hard core 0
+* soft core 0
 EOF
 
-# Note: fs.suid_dumpable is set in section 4 sysctl block
+# Also via systemd
+mkdir -p /etc/systemd/coredump.conf.d
+cat > /etc/systemd/coredump.conf.d/cis.conf << 'EOF'
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+EOF
 
 # -----------------------------------------------------------------------------
 # SECTION 4 - Kernel / sysctl Hardening
@@ -198,12 +225,11 @@ echo "[4] Kernel Parameter Hardening"
 
 cat > /etc/sysctl.d/99-cis.conf << 'EOF'
 # =============================================================================
-# CIS Benchmark - Kernel Parameters
+# CIS Benchmark - Kernel Parameters - Debian 13
 # =============================================================================
 
-# --- Network: Disable IP forwarding (not a router) ---
+# --- Network: Disable IP forwarding ---
 net.ipv4.ip_forward = 0
-net.ipv6.conf.all.forwarding = 0
 
 # --- Network: Disable packet redirect sending ---
 net.ipv4.conf.all.send_redirects = 0
@@ -212,8 +238,6 @@ net.ipv4.conf.default.send_redirects = 0
 # --- Network: Disable ICMP redirect acceptance ---
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv6.conf.default.accept_redirects = 0
 
 # --- Network: Disable secure ICMP redirect acceptance ---
 net.ipv4.conf.all.secure_redirects = 0
@@ -226,8 +250,6 @@ net.ipv4.conf.default.log_martians = 1
 # --- Network: Disable source routing ---
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
-net.ipv6.conf.all.accept_source_route = 0
-net.ipv6.conf.default.accept_source_route = 0
 
 # --- Network: Enable reverse path filtering ---
 net.ipv4.conf.all.rp_filter = 1
@@ -239,15 +261,16 @@ net.ipv4.icmp_echo_ignore_broadcasts = 1
 # --- Network: Ignore bogus ICMP error responses ---
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 
-# --- Network: Enable SYN cookies (SYN flood protection) ---
+# --- Network: Enable SYN cookies ---
 net.ipv4.tcp_syncookies = 1
-
-# --- Network: Disable IPv6 router advertisements ---
-net.ipv6.conf.all.accept_ra = 0
-net.ipv6.conf.default.accept_ra = 0
 
 # --- Network: Disable TCP timestamps ---
 net.ipv4.tcp_timestamps = 0
+
+# --- Disable IPv6 completely ---
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
 
 # --- Kernel: Restrict dmesg to root ---
 kernel.dmesg_restrict = 1
@@ -272,13 +295,9 @@ kernel.unprivileged_bpf_disabled = 1
 
 # --- Kernel: Restrict perf events ---
 kernel.perf_event_paranoid = 3
-
-# --- Disable IPv6 completely ---
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
 
+chmod 600 /etc/sysctl.d/99-cis.conf
 sysctl --system > /dev/null 2>&1
 
 # -----------------------------------------------------------------------------
@@ -286,17 +305,19 @@ sysctl --system > /dev/null 2>&1
 # -----------------------------------------------------------------------------
 echo "[5] SSH Hardening"
 
+# Ensure SSH is installed
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
+
 SSHD_CONFIG="/etc/ssh/sshd_config"
 cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak"
 
 cat > "$SSHD_CONFIG" << 'EOF'
 # =============================================================================
-# CIS Benchmark - SSH Server Configuration
+# CIS Benchmark - SSH Server Configuration - Debian 13
 # =============================================================================
 
 # --- Protocol & Port ---
 Port 22
-Protocol 2
 
 # --- Authentication ---
 PermitRootLogin no
@@ -305,7 +326,7 @@ MaxSessions 10
 PubkeyAuthentication yes
 PasswordAuthentication yes
 PermitEmptyPasswords no
-ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 UsePAM yes
 
 # --- Host Keys ---
@@ -322,6 +343,7 @@ AllowTcpForwarding no
 AllowAgentForwarding no
 PermitTunnel no
 Banner /etc/issue.net
+PrintLastLog yes
 
 # --- Ciphers & MACs (strong only) ---
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
@@ -341,17 +363,22 @@ SyslogFacility AUTH
 Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
 
-systemctl restart ssh
+# Validate config before restarting
+sshd -t && systemctl restart ssh || {
+    echo "ERROR: sshd config invalid, restoring backup"
+    cp "${SSHD_CONFIG}.bak" "$SSHD_CONFIG"
+    systemctl restart ssh
+}
 
 # -----------------------------------------------------------------------------
 # SECTION 6 - PAM / Password Policy
 # -----------------------------------------------------------------------------
 echo "[6] PAM & Password Policy"
 
-# 6.1 Password quality requirements
-cat > /etc/security/pwquality.conf << 'EOF'
+# 6.1 Password quality - pwquality.conf uses variable expansion so no quotes on EOF
+cat > /etc/security/pwquality.conf << EOF
 # CIS Password Quality Requirements
-minlen = $PASS_MIN_LEN
+minlen = ${PASS_MIN_LEN}
 minclass = 4
 dcredit = -1
 ucredit = -1
@@ -364,23 +391,30 @@ dictcheck = 1
 EOF
 
 # 6.2 Password aging
-sed -i "s/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   $PASS_MAX_DAYS/" /etc/login.defs
-sed -i "s/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   $PASS_MIN_DAYS/" /etc/login.defs
-sed -i "s/^PASS_WARN_AGE.*/PASS_WARN_AGE   $PASS_WARN_AGE/" /etc/login.defs
+sed -i "s/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   ${PASS_MAX_DAYS}/" /etc/login.defs
+sed -i "s/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   ${PASS_MIN_DAYS}/" /etc/login.defs
+sed -i "s/^PASS_WARN_AGE.*/PASS_WARN_AGE   ${PASS_WARN_AGE}/" /etc/login.defs
 
-# 6.3 Account lockout via faillock
-cat > /etc/security/faillock.conf << 'EOF'
+# 6.3 Account lockout via faillock (Debian 13 uses pam_faillock, not tally2)
+cat > /etc/security/faillock.conf << EOF
 # CIS - Account lockout policy
-deny = $LOCKOUT_ATTEMPTS
-fail_interval = $LOCKOUT_TIME
-unlock_time = $LOCKOUT_TIME
+deny = ${LOCKOUT_ATTEMPTS}
+fail_interval = ${LOCKOUT_TIME}
+unlock_time = ${LOCKOUT_TIME}
+audit
 EOF
 
-# 6.4 Ensure password hashing is SHA-512
-sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD SHA512/' /etc/login.defs
-echo "SHA_CRYPT_MIN_ROUNDS 5000" >> /etc/login.defs
+# 6.4 Password hashing SHA-512
+if grep -q "^ENCRYPT_METHOD" /etc/login.defs; then
+    sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD SHA512/' /etc/login.defs
+else
+    echo "ENCRYPT_METHOD SHA512" >> /etc/login.defs
+fi
+if ! grep -q "^SHA_CRYPT_MIN_ROUNDS" /etc/login.defs; then
+    echo "SHA_CRYPT_MIN_ROUNDS 5000" >> /etc/login.defs
+fi
 
-# 6.5 Inactive account lockout
+# 6.5 Inactive account lockout (30 days after password expiry)
 useradd -D -f 30
 
 # -----------------------------------------------------------------------------
@@ -388,7 +422,7 @@ useradd -D -f 30
 # -----------------------------------------------------------------------------
 echo "[7] User & Group Security"
 
-# 7.1 Root is the only UID 0 account
+# 7.1 Check for non-root UID 0 accounts
 echo "[7.1] Checking UID 0 accounts"
 UID0_USERS=$(awk -F: '($3 == 0) { print $1 }' /etc/passwd | grep -v "^root$" || true)
 if [ -n "$UID0_USERS" ]; then
@@ -397,82 +431,98 @@ else
     echo "[7.1] OK - root is the only UID 0 account"
 fi
 
-# 7.2 Ensure root PATH integrity
+# 7.2 Root PATH integrity check
 if echo "$PATH" | grep -q "::"; then
     echo "WARNING: Empty directory in root PATH"
 fi
+if echo "$PATH" | grep -q ":$"; then
+    echo "WARNING: Trailing colon in root PATH"
+fi
 
-# 7.3 Lock system accounts
+# 7.3 Lock system accounts (UID < 1000, skip root and accounts with valid shells)
 echo "[7.3] Locking system accounts"
-while IFS= read -r user; do
-    passwd -l "$user" 2>/dev/null || true
-done < <(awk -F: '($3 < 1000) {print $1}' /etc/passwd | grep -v "^root$" || true)
+while IFS=: read -r username _ uid _ _ _ shell; do
+    if [ "$uid" -lt 1000 ] && [ "$username" != "root" ] && \
+       [ "$shell" != "/usr/sbin/nologin" ] && [ "$shell" != "/bin/false" ] && \
+       [ "$shell" != "/sbin/nologin" ]; then
+        passwd -l "$username" 2>/dev/null || true
+    fi
+done < /etc/passwd
 
-# 7.4 Remove legacy + entries from passwd/shadow/group
-sed -i '/^+:/d' /etc/passwd /etc/shadow /etc/group
+# 7.4 Remove legacy + entries
+sed -i '/^+:/d' /etc/passwd /etc/shadow /etc/group 2>/dev/null || true
 
 # 7.5 Set umask
-sed -i "s/^UMASK.*/UMASK $UMASK/" /etc/login.defs
-echo "umask $UMASK" >> /etc/profile.d/cis-umask.sh
+if grep -q "^UMASK" /etc/login.defs; then
+    sed -i "s/^UMASK.*/UMASK ${UMASK}/" /etc/login.defs
+else
+    echo "UMASK ${UMASK}" >> /etc/login.defs
+fi
+echo "umask ${UMASK}" > /etc/profile.d/cis-umask.sh
+chmod 644 /etc/profile.d/cis-umask.sh
 
-# 7.6 Ensure home directories exist and are secured
+# 7.6 Secure home directories
 echo "[7.6] Securing home directories"
-awk -F: '($3 >= 1000 && $7 != "/usr/sbin/nologin" && $7 != "/bin/false") {print $1":"$6}' \
-    /etc/passwd | while IFS=: read user homedir; do
-    if [ -d "$homedir" ]; then
+while IFS=: read -r user _ uid _ _ homedir shell; do
+    if [ "$uid" -ge 1000 ] && \
+       [ "$shell" != "/usr/sbin/nologin" ] && \
+       [ "$shell" != "/bin/false" ] && \
+       [ -d "$homedir" ]; then
         chmod 750 "$homedir" 2>/dev/null || true
-        chown "$user" "$homedir" 2>/dev/null || true
     fi
-done
+done < /etc/passwd
 
 # -----------------------------------------------------------------------------
 # SECTION 8 - Auditd Configuration
 # -----------------------------------------------------------------------------
 echo "[8] Auditd Configuration"
 
+# Ensure audit directory exists
+mkdir -p /etc/audit/rules.d
+
 cat > /etc/audit/rules.d/cis.rules << 'EOF'
 # =============================================================================
-# CIS Benchmark - Audit Rules
+# CIS Benchmark - Audit Rules - Debian 13
 # =============================================================================
 
-# --- Remove all existing rules ---
+# Remove all existing rules
 -D
 
-# --- Set buffer size ---
+# Buffer size
 -b 8192
 
-# --- Failure mode (1=printk, 2=panic) ---
+# Failure mode (1=printk, 2=panic)
 -f 1
 
-# --- System calls: identity changes ---
+# --- Identity changes ---
 -w /etc/group -p wa -k identity
 -w /etc/passwd -p wa -k identity
 -w /etc/gshadow -p wa -k identity
 -w /etc/shadow -p wa -k identity
 -w /etc/security/opasswd -p wa -k identity
 
-# --- System calls: network config changes ---
+# --- Network/locale changes ---
 -w /etc/issue -p wa -k system-locale
 -w /etc/issue.net -p wa -k system-locale
 -w /etc/hosts -p wa -k system-locale
 -w /etc/network -p wa -k system-locale
+-w /etc/networks -p wa -k system-locale
 
 # --- Privileged commands ---
--a always,exit -F path=/usr/bin/passwd -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
--a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
--a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
--a always,exit -F path=/usr/bin/chage -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
--a always,exit -F path=/usr/bin/gpasswd -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
--a always,exit -F path=/usr/bin/newgrp -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
--a always,exit -F path=/usr/bin/chsh -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
--a always,exit -F path=/usr/bin/chfn -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
--a always,exit -F path=/bin/mount -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
--a always,exit -F path=/bin/umount -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
+-a always,exit -F path=/usr/bin/passwd -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/chage -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/gpasswd -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/newgrp -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/chsh -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/chfn -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/mount -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
+-a always,exit -F path=/usr/bin/umount -F perm=x -F auid>=1000 -F auid!=-1 -k privileged
 
 # --- Login/logout events ---
--w /var/log/faillog -p wa -k logins
 -w /var/log/lastlog -p wa -k logins
--w /var/log/tallylog -p wa -k logins
+-w /var/run/faillock -p wa -k logins
 
 # --- Session events ---
 -w /var/run/utmp -p wa -k session
@@ -480,37 +530,37 @@ cat > /etc/audit/rules.d/cis.rules << 'EOF'
 -w /var/log/btmp -p wa -k logins
 
 # --- DAC permission changes ---
--a always,exit -F arch=b64 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_mod
--a always,exit -F arch=b32 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_mod
--a always,exit -F arch=b64 -S chown -S fchown -S fchownat -S lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
--a always,exit -F arch=b32 -S chown -S fchown -S fchownat -S lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod
--a always,exit -F arch=b64 -S setxattr -S lsetxattr -S fsetxattr -S removexattr -S lremovexattr -S fremovexattr -F auid>=1000 -F auid!=4294967295 -k perm_mod
--a always,exit -F arch=b32 -S setxattr -S lsetxattr -S fsetxattr -S removexattr -S lremovexattr -S fremovexattr -F auid>=1000 -F auid!=4294967295 -k perm_mod
+-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b32 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b64 -S chown,fchown,fchownat,lchown -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b32 -S chown,fchown,fchownat,lchown -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=-1 -k perm_mod
+-a always,exit -F arch=b32 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=-1 -k perm_mod
 
-# --- Unauthorized file access attempts ---
--a always,exit -F arch=b64 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=4294967295 -k access
--a always,exit -F arch=b32 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=4294967295 -k access
--a always,exit -F arch=b64 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=4294967295 -k access
--a always,exit -F arch=b32 -S creat -S open -S openat -S truncate -S ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=4294967295 -k access
+# --- Unauthorized file access ---
+-a always,exit -F arch=b64 -S creat,open,openat,truncate,ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=-1 -k access
+-a always,exit -F arch=b32 -S creat,open,openat,truncate,ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=-1 -k access
+-a always,exit -F arch=b64 -S creat,open,openat,truncate,ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=-1 -k access
+-a always,exit -F arch=b32 -S creat,open,openat,truncate,ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=-1 -k access
 
 # --- Kernel module loading ---
 -w /sbin/insmod -p x -k modules
 -w /sbin/rmmod -p x -k modules
 -w /sbin/modprobe -p x -k modules
--a always,exit -F arch=b64 -S init_module -S delete_module -k modules
+-a always,exit -F arch=b64 -S init_module,delete_module,finit_module -k modules
 
-# --- Sudo usage ---
+# --- Sudoers changes ---
 -w /etc/sudoers -p wa -k scope
 -w /etc/sudoers.d/ -p wa -k scope
 
 # --- Time changes ---
--a always,exit -F arch=b64 -S adjtimex -S settimeofday -k time-change
--a always,exit -F arch=b32 -S adjtimex -S settimeofday -S stime -k time-change
+-a always,exit -F arch=b64 -S adjtimex,settimeofday -k time-change
+-a always,exit -F arch=b32 -S adjtimex,settimeofday,stime -k time-change
 -a always,exit -F arch=b64 -S clock_settime -k time-change
 -a always,exit -F arch=b32 -S clock_settime -k time-change
 -w /etc/localtime -p wa -k time-change
 
-# --- Make rules immutable (comment out during template build, enable for prod) ---
+# Make rules immutable — uncomment for production (requires reboot to change)
 # -e 2
 EOF
 
@@ -525,7 +575,9 @@ echo "[9] Firewall Configuration"
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
+ufw default deny forward
 ufw allow ssh
+ufw logging on
 ufw --force enable
 
 # -----------------------------------------------------------------------------
@@ -534,26 +586,31 @@ ufw --force enable
 echo "[10] AppArmor"
 
 systemctl enable apparmor
-systemctl start apparmor
+systemctl start apparmor 2>/dev/null || true
 
-# Set all profiles to enforce mode
-aa-enforce /etc/apparmor.d/* 2>/dev/null || true
+# Enforce all available profiles
+if command -v aa-enforce &>/dev/null; then
+    find /etc/apparmor.d -maxdepth 1 -type f | while read -r profile; do
+        aa-enforce "$profile" 2>/dev/null || true
+    done
+fi
 
 # -----------------------------------------------------------------------------
-# SECTION 11 - Logging
+# SECTION 11 - Logging (rsyslog)
 # -----------------------------------------------------------------------------
 echo "[11] Logging Configuration"
 
-# 11.1 Ensure rsyslog is enabled
 systemctl enable rsyslog
 systemctl start rsyslog
 
-# 11.2 Set rsyslog default file permissions
-grep -q "^\$FileCreateMode" /etc/rsyslog.conf && \
-    sed -i 's/^\$FileCreateMode.*/$FileCreateMode 0640/' /etc/rsyslog.conf || \
-    echo "\$FileCreateMode 0640" >> /etc/rsyslog.conf
+# Set default file permissions for new log files
+if grep -q '^\$FileCreateMode' /etc/rsyslog.conf; then
+    sed -i 's/^\$FileCreateMode.*/\$FileCreateMode 0640/' /etc/rsyslog.conf
+else
+    echo '$FileCreateMode 0640' >> /etc/rsyslog.conf
+fi
 
-# 11.3 Logrotate hardening
+# Logrotate config
 cat > /etc/logrotate.d/cis-rsyslog << 'EOF'
 /var/log/syslog
 /var/log/auth.log
@@ -580,7 +637,7 @@ echo "[12] Cron Hardening"
 
 systemctl enable cron
 
-# Restrict cron to root only
+# Restrict cron/at to root only
 rm -f /etc/cron.deny /etc/at.deny
 touch /etc/cron.allow /etc/at.allow
 chown root:root /etc/cron.allow /etc/at.allow
@@ -588,8 +645,10 @@ chmod 600 /etc/cron.allow /etc/at.allow
 
 # Secure cron directories
 for dir in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /etc/cron.d; do
-    chown root:root "$dir"
-    chmod 700 "$dir"
+    if [ -d "$dir" ]; then
+        chown root:root "$dir"
+        chmod 700 "$dir"
+    fi
 done
 
 chown root:root /etc/crontab
@@ -610,15 +669,15 @@ chmod 640 /etc/shadow /etc/gshadow
 find /etc/ssh -name "ssh_host_*_key" -exec chown root:root {} \; -exec chmod 600 {} \;
 find /etc/ssh -name "ssh_host_*_key.pub" -exec chown root:root {} \; -exec chmod 644 {} \;
 
-# Sysctl
-chown root:root /etc/sysctl.conf
-chmod 600 /etc/sysctl.conf
+# sysctl hardening file
+chown root:root /etc/sysctl.d/99-cis.conf
+chmod 600 /etc/sysctl.d/99-cis.conf
 
-# 13.1 Find world-writable files (log only, review manually)
+# 13.1 World-writable files (log for review)
 echo "[13.1] World-writable files (review log):"
 find / -xdev -type f -perm -0002 2>/dev/null | tee -a "$LOG" || true
 
-# 13.2 Find SUID/SGID binaries (log only)
+# 13.2 SUID/SGID binaries (log for review)
 echo "[13.2] SUID/SGID binaries (review log):"
 find / -xdev \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null | tee -a "$LOG" || true
 
@@ -647,99 +706,101 @@ All activity is monitored and logged.
 EOF
 
 cp /etc/issue /etc/issue.net
-
 chown root:root /etc/issue /etc/issue.net
 chmod 644 /etc/issue /etc/issue.net
-
-# Remove MOTD
 truncate -s 0 /etc/motd
 
 # -----------------------------------------------------------------------------
-# SECTION 15 - Time Synchronization
+# SECTION 15 - Time Synchronization (chrony)
 # -----------------------------------------------------------------------------
 echo "[15] Time Synchronization"
 
 systemctl enable chrony
-systemctl start chrony
 
-# Replace default pool/server lines with our NTP servers
+# Replace default pool/server entries with our NTP servers
 sed -i '/^pool /d' /etc/chrony/chrony.conf
 sed -i '/^server /d' /etc/chrony/chrony.conf
 for srv in $NTP_SERVERS; do
     echo "server $srv iburst" >> /etc/chrony/chrony.conf
 done
-grep -q "^bindaddress" /etc/chrony/chrony.conf || \
-    echo "bindaddress 127.0.0.1" >> /etc/chrony/chrony.conf
+
+# Restrict chrony control to localhost
+grep -q "^bindcmdaddress 127.0.0.1" /etc/chrony/chrony.conf || \
+    echo "bindcmdaddress 127.0.0.1" >> /etc/chrony/chrony.conf
+
+systemctl restart chrony
 
 # -----------------------------------------------------------------------------
-# SECTION 16 - Sudo Configuration
+# SECTION 16 - Sudo Hardening
 # -----------------------------------------------------------------------------
 echo "[16] Sudo Hardening"
 
-# Require password for sudo
-grep -q "^Defaults.*timestamp_timeout" /etc/sudoers || \
-    echo "Defaults timestamp_timeout=$SUDO_TIMEOUT" >> /etc/sudoers
+# Validate sudoers before editing
+visudo -c -f /etc/sudoers || { echo "ERROR: sudoers invalid, skipping"; exit 1; }
 
-# Log sudo usage
+grep -q "^Defaults.*timestamp_timeout" /etc/sudoers || \
+    echo "Defaults timestamp_timeout=${SUDO_TIMEOUT}" >> /etc/sudoers
+
 grep -q "^Defaults.*logfile" /etc/sudoers || \
     echo 'Defaults logfile="/var/log/sudo.log"' >> /etc/sudoers
 
-# Require TTY for sudo
 grep -q "^Defaults.*requiretty" /etc/sudoers || \
     echo "Defaults requiretty" >> /etc/sudoers
 
-# Secure sudo log
+grep -q "^Defaults.*use_pty" /etc/sudoers || \
+    echo "Defaults use_pty" >> /etc/sudoers
+
 touch /var/log/sudo.log
 chown root:root /var/log/sudo.log
 chmod 600 /var/log/sudo.log
 
 # -----------------------------------------------------------------------------
-# SECTION 17 - Legacy Interface Naming (eth0 instead of ens/enp)
+# SECTION 17 - Legacy Interface Naming + IPv6 Disable
 # -----------------------------------------------------------------------------
-echo "[17] Legacy Interface Naming"
+echo "[17] Interface Naming & IPv6"
 
 # 17.1 GRUB kernel parameters
-sed -i 's/GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0 ipv6.disable=1"/' \
-    /etc/default/grub
-update-grub
+if [ -f /etc/default/grub ]; then
+    sed -i 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0 ipv6.disable=1"/' \
+        /etc/default/grub
+    update-grub 2>/dev/null || grub-mkconfig -o /boot/grub/grub.cfg
+fi
 
-# 17.2 udev rule to pin first vmxnet3 NIC to eth0
+# 17.2 udev rule for eth0 naming (template-safe: matches by driver not MAC)
 cat > /etc/udev/rules.d/70-persistent-net.rules << 'EOF'
 SUBSYSTEM=="net", ACTION=="add", DRIVERS=="vmxnet3", ATTR{type}=="1", KERNEL=="en*", NAME="eth0"
 EOF
 
-# 17.3 Ensure ifupdown is managing networking (not networkd)
+# 17.3 Disable systemd-networkd, use ifupdown
 systemctl disable systemd-networkd 2>/dev/null || true
 systemctl disable systemd-resolved 2>/dev/null || true
-systemctl enable networking
+systemctl mask systemd-networkd 2>/dev/null || true
+systemctl enable networking 2>/dev/null || true
 
-echo "[17] Legacy naming configured - eth0 will be active after reboot"
-
-# -----------------------------------------------------------------------------
-# SECTION 17b - Remove cloud-init if present
-# -----------------------------------------------------------------------------
-echo "[17b] Removing cloud-init"
-apt-get purge -y -qq cloud-init 2>/dev/null || true
-rm -rf /etc/cloud /var/lib/cloud
-apt-get autoremove -y -qq
+echo "[17] Done - eth0 and IPv6 disable active after reboot"
 
 # -----------------------------------------------------------------------------
-# SECTION 18 - AIDE Initialization
+# SECTION 18 - AIDE File Integrity
 # -----------------------------------------------------------------------------
 echo "[18] AIDE File Integrity"
 
-# Initialize AIDE database (takes a few minutes)
-echo "Initializing AIDE database - this may take a while..."
-aideinit --yes 2>/dev/null || aide --init 2>/dev/null || true
-mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db 2>/dev/null || true
+echo "Initializing AIDE database - this may take several minutes..."
+aideinit -y -f 2>/dev/null || aide --init 2>/dev/null || true
 
-# Schedule daily AIDE check
+# Debian puts new db at aide.db.new
+if [ -f /var/lib/aide/aide.db.new ]; then
+    mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+elif [ -f /var/lib/aide/aide.db.new.gz ]; then
+    mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+fi
+
+# Daily AIDE check via cron
 cat > /etc/cron.daily/aide-check << 'EOF'
 #!/bin/bash
-/usr/bin/aide --check | mail -s "AIDE Report - $(hostname) - $(date)" root
+/usr/bin/aide --check 2>&1 | /usr/bin/mail -s "AIDE Report - $(hostname) - $(date +%Y-%m-%d)" root
 EOF
 chmod 700 /etc/cron.daily/aide-check
-
+chown root:root /etc/cron.daily/aide-check
 
 # =============================================================================
 # SUMMARY
@@ -753,17 +814,17 @@ echo ""
 echo "NEXT STEPS before sealing template:"
 echo "  1. Review world-writable files in $LOG"
 echo "  2. Review SUID/SGID binaries in $LOG"
-echo "  3. Verify SSH access still works (new session before closing this one)"
-echo "  4. Enable audit immutability (-e 2) in /etc/audit/rules.d/cis.rules"
-echo "     if deploying to production (cannot undo without reboot)"
-echo "  5. Reboot once to verify eth0 naming before sealing"
-echo "  6. Run seal-vm.sh after this script"
+echo "  3. Verify SSH works — open new session before closing this one"
+echo "  4. Reboot — verify eth0 naming and IP still works"
+echo "  5. Enable audit immutability: uncomment -e 2 in /etc/audit/rules.d/cis.rules"
+echo "  6. Run seal-vm.sh to seal template"
 echo ""
 echo "  PER-VM WORKFLOW:"
-echo "  After deploying VM from template:"
-echo "    1. Access via VCD console"
-echo "    2. Edit /etc/vm-init/vm-init.conf with correct values"
-echo "    3. Reboot — vm-init runs once, configures network, disables itself"
+echo "    1. Deploy VM from template in VCD"
+echo "    2. Set IP Pool on NIC — VMware Tools applies it automatically"
+echo "    3. Edit HOSTNAME/DNS/NTP in vm-customize.sh"
+echo "    4. Paste vm-customize.sh into VCD Guest OS Customization Script"
+echo "    5. Power on — hostname, DNS and NTP configured on first boot"
 echo ""
 echo "  Verify with:"
 echo "  findmnt -lo TARGET,OPTIONS"
@@ -771,5 +832,5 @@ echo "  sshd -T | grep -E 'permitroot|maxauthtries|x11forward'"
 echo "  auditctl -l"
 echo "  ufw status verbose"
 echo "  aa-status"
-echo "  ip a  # confirm eth0"
+echo "  ip a  # confirm eth0, no inet6"
 echo ""
